@@ -3,22 +3,31 @@ const axios = require('axios');
 const vm = require('vm');
 
 const app = express();
-// Railway يقوم بتمرير البورت تلقائياً عبر متغيرات البيئة
 const PORT = process.env.PORT || 3000;
 
 app.get('/api/extract', async (req, res) => {
-    // استقبال الرابط من الباراميتر: /api/extract?url=...
     const targetUrl = req.query.url;
 
     if (!targetUrl) {
         return res.status(400).json({ error: 'يرجى تمرير رابط url صالح في الطلب.' });
     }
 
+    // استخراج IP المستخدم الحقيقي الذي يزور الـ API الخاص بك
+    let clientIp = req.headers['x-forwarded-for'] || req.socket.remoteAddress;
+    // تنظيف الـ IP في حال كان هناك أكثر من IP (يحدث خلف البروكسيات)
+    if (clientIp && clientIp.includes(',')) {
+        clientIp = clientIp.split(',')[0].trim();
+    }
+
     try {
         const response = await axios.get(targetUrl, {
             headers: {
                 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36',
-                'Referer': 'https://www.fasel-hd.co/'
+                'Referer': 'https://www.fasel-hd.co/',
+                // حقن الـ IP الخاص بالمستخدم في الهيدرز لمحاولة خداع سيرفر الموقع
+                'X-Forwarded-For': clientIp,
+                'X-Real-IP': clientIp,
+                'Client-IP': clientIp
             }
         });
 
@@ -40,9 +49,7 @@ app.get('/api/extract', async (req, res) => {
                 })
             },
             window: {},
-            Hls: {
-                isSupported: () => false
-            },
+            Hls: { isSupported: () => false },
             setInterval: () => {},
             setTimeout: () => {},
             console: { log: () => {}, warn: () => {}, error: () => {} }
@@ -55,13 +62,13 @@ app.get('/api/extract', async (req, res) => {
         vm.runInContext(scriptCode, sandbox);
 
         if (sandbox.videoSrc) {
-            // استخراج الدومين الأساسي للسيرفر إذا احتجته للهيدرز
             const streamDomainObj = new URL(sandbox.videoSrc);
             
             return res.json({
                 success: true,
                 server_url: streamDomainObj.origin,
-                stream_url: sandbox.videoSrc,
+                stream_url: sandbox.videoSrc, // هذا الرابط يفترض أن يعمل الآن عند المستخدم
+                client_ip_used: clientIp, // أضفناه للتأكد من التقاط الـ IP الصحيح
                 headers: {
                     "Origin": "https://www.fasel-hd.co",
                     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
