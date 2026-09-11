@@ -11,7 +11,7 @@ app.use((req, res, next) => {
     next();
 });
 
-// دالة مساعدة لتوليد هيدرز ديناميكية بناءً على رابط الموقع لتخطي الحماية
+// دالة الهيدرز الأساسية (تستخدم للبروكسي)
 const getHeaders = (url) => {
     try {
         const urlObj = new URL(url);
@@ -24,90 +24,117 @@ const getHeaders = (url) => {
         };
     } catch (e) {
         return {
-            "Origin": "https://www.fasel-hd.co",
-            "Referer": "https://www.fasel-hd.co/",
+            "Origin": "https://www.faselhd.club",
+            "Referer": "https://www.faselhd.club/",
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
         };
     }
 };
 
-// دالة مساعدة لاستخراج رابط البث من المصادر المتعددة
+// دالة استخراج رابط البث المتطورة (4 طبقات من الفحص)
 const extractStreamUrl = async (targetUrl) => {
-    const headers = getHeaders(targetUrl);
-    const response = await axios.get(targetUrl, { headers });
-    const html = response.data;
+    // هيدرز قوية للتمويه أثناء طلب صفحة المشغل
+    const extractHeaders = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
+        "Referer": "https://www.faselhd.club/",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.5",
+        "Connection": "keep-alive",
+        "Upgrade-Insecure-Requests": "1"
+    };
 
-    // 1. محاولة استخراج صيغة المشغل القديم
-    const faselMatch = html.match(/(var video = document\.getElementById\('video'\);[\s\S]+?)<\/script>/);
-    if (faselMatch) {
-        const sandbox = {
-            document: { getElementById: () => ({ canPlayType: () => false, src: '' }) },
-            window: {}, Hls: { isSupported: () => false },
-            setInterval: () => {}, setTimeout: () => {}, console: { log: () => {}, warn: () => {}, error: () => {} }
-        };
-        sandbox.window = sandbox; sandbox.global = sandbox;
-        vm.createContext(sandbox); 
-        vm.runInContext(faselMatch[1], sandbox);
-        if (sandbox.videoSrc) return sandbox.videoSrc;
-    }
+    try {
+        const response = await axios.get(targetUrl, { headers: extractHeaders });
+        const html = response.data;
 
-    // 2. محاولة استخراج صيغة المشغلات الجديدة المشفرة باستخدام (eval) و jwplayer
-    const evalMatch = html.match(/(eval\(function\(p,a,c,k,e,d\).+?\.split\('\|'\)\)\))/);
-    if (evalMatch) {
-        let extractedUrl = null;
-        
-        // كائن وهمي لخداع jQuery ومنع الأخطاء في السكريبت
-        const chainProxy = new Proxy({}, { get: () => () => chainProxy });
-        
-        const sandbox = {
-            window: { innerHeight: 100, innerWidth: 100 },
-            document: {
-                getElementById: () => ({}),
-                createElement: () => ({ setAttribute: ()=>{}, appendChild: ()=>{} }),
-                body: { appendChild: ()=>{} },
-                scripts: []
-            },
-            navigator: { userAgent: "Mozilla/5.0" },
-            setTimeout: () => {}, setInterval: () => {},
-            Math: Math, Date: Date,
-            encodeURIComponent: encodeURIComponent, unescape: unescape, btoa: btoa,
-            console: { log: ()=>{}, warn: ()=>{}, error: ()=>{} },
-            $: function() { return chainProxy; }
-        };
-        sandbox.$.ajaxSetup = () => {};
-        sandbox.$.cookie = () => {};
-
-        // محاكاة jwplayer لاعتراض إعدادات التشغيل واستخراج رابط الـ m3u8
-        sandbox.jwplayer = function() {
-            const jw = new Proxy({}, {
-                get: (target, prop) => {
-                    if (prop === 'setup') {
-                        return (config) => {
-                            if (config && config.playlist && config.playlist.length > 0) {
-                                extractedUrl = config.playlist[0].file;
-                            } else if (config && config.file) {
-                                extractedUrl = config.file;
-                            }
-                            return jw;
-                        };
-                    }
-                    return () => jw;
-                }
-            });
-            return jw;
-        };
-
-        vm.createContext(sandbox);
-        try {
-            vm.runInContext(evalMatch[1], sandbox);
-        } catch (e) {
-            console.error("Eval block execution error:", e.message);
+        // التحقق من حظر السيرفر بواسطة Cloudflare
+        if (html.includes('Cloudflare') || html.includes('Just a moment') || html.includes('cf-browser-verification')) {
+            throw new Error('السيرفر محظور بواسطة Cloudflare (يحتاج تخطي Captcha).');
         }
 
-        if (extractedUrl) return extractedUrl;
-    }
+        let extractedUrl = null;
 
-    throw new Error('لم يتم العثور على سكريبت المشغل المدعوم أو فشل الاستخراج.');
+        // الطبقة 1: البحث المباشر السريع (إذا لم يكن الرابط مشفراً)
+        const directMatch = html.match(/(?:file|src|url)\s*:\s*["'](https?:\/\/[^"']+\.m3u8[^"']*)["']/i);
+        if (directMatch) return directMatch[1];
+
+        // الطبقة 2: بحث عن أي رابط m3u8 صريح داخل الصفحة كحل بديل
+        const fallbackMatch = html.match(/(https?:\/\/[a-zA-Z0-9\-\.]+\.[a-zA-Z]{2,}(?:\/\S*)?\.m3u8[^\s"']*)/);
+        if (fallbackMatch) return fallbackMatch[1];
+
+        // الطبقة 3: فك التشفير لمشغلات hglamioz / niramirus (تدعم p,a,c,k,e,d أو p,a,c,k,e,r)
+        const evalMatch = html.match(/(eval\s*\(\s*function\s*\(p,a,c,k,e,[a-zA-Z0-9_]+\).*?\.split\('\|'\).*?\)\))/);
+        if (evalMatch) {
+            const chainProxy = new Proxy({}, { get: () => () => chainProxy });
+            const sandbox = {
+                window: { innerHeight: 100, innerWidth: 100 },
+                document: { 
+                    getElementById: () => ({}), 
+                    createElement: () => ({ setAttribute: ()=>{}, appendChild: ()=>{} }), 
+                    body: { appendChild: ()=>{} }, 
+                    scripts: [] 
+                },
+                navigator: { userAgent: "Mozilla/5.0" },
+                setTimeout: () => {}, setInterval: () => {}, Math: Math, Date: Date, 
+                encodeURIComponent: encodeURIComponent, unescape: unescape, btoa: btoa,
+                console: { log: ()=>{}, warn: ()=>{}, error: ()=>{} },
+                $: function() { return chainProxy; }
+            };
+            
+            sandbox.$.ajaxSetup = () => {}; 
+            sandbox.$.cookie = () => {};
+
+            sandbox.jwplayer = function() {
+                const jw = new Proxy({}, {
+                    get: (target, prop) => {
+                        if (prop === 'setup') {
+                            return (config) => {
+                                if (config && config.playlist && config.playlist.length > 0) {
+                                    extractedUrl = config.playlist[0].file;
+                                } else if (config && config.file) {
+                                    extractedUrl = config.file;
+                                }
+                                return jw;
+                            };
+                        }
+                        return () => jw;
+                    }
+                });
+                return jw;
+            };
+
+            vm.createContext(sandbox);
+            try {
+                vm.runInContext(evalMatch[1], sandbox);
+            } catch (e) {
+                console.error("Eval execution error:", e.message);
+            }
+
+            if (extractedUrl) return extractedUrl;
+        }
+
+        // الطبقة 4: فك التشفير للسكريبت القديم (إذا كانوا لا يزالون يستخدمونه في بعض السيرفرات)
+        const faselMatch = html.match(/(var video = document\.getElementById\('video'\);[\s\S]+?)<\/script>/);
+        if (faselMatch) {
+            const sandbox = { 
+                document: { getElementById: () => ({ canPlayType: () => false, src: '' }) }, 
+                window: {}, Hls: { isSupported: () => false }, 
+                setInterval: () => {}, setTimeout: () => {}, 
+                console: { log: () => {} } 
+            };
+            sandbox.window = sandbox; sandbox.global = sandbox;
+            vm.createContext(sandbox); 
+            vm.runInContext(faselMatch[1], sandbox);
+            if (sandbox.videoSrc) return sandbox.videoSrc;
+        }
+
+        // تسجيل البيانات في حال الفشل للمساعدة في اكتشاف المشكلة
+        console.error("لم يتم استخراج الرابط. جزء من محتوى الصفحة لمعرفة السبب:\n", html.substring(0, 500));
+        throw new Error('لم يتم العثور على سكريبت المشغل المدعوم أو فشل الاستخراج.');
+
+    } catch (error) {
+        throw new Error(error.message);
+    }
 };
 
 // 1. مسار الاستخراج (إرجاع روابط JSON)
@@ -136,7 +163,6 @@ app.get('/api/play', async (req, res) => {
 
     try {
         const streamUrl = await extractStreamUrl(targetUrl);
-        // توجيه تلقائي لمسار البروكسي مع تمرير مصدر الصفحة للحفاظ على صحة الهيدرز
         const proxyUrl = `/api/proxy?url=${encodeURIComponent(streamUrl)}&referer=${encodeURIComponent(targetUrl)}`;
         res.redirect(proxyUrl);
     } catch (error) {
