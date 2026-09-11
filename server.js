@@ -1,11 +1,12 @@
 const express = require('express');
 const axios = require('axios');
 const vm = require('vm');
+const crypto = require('crypto'); // أضفنا مكتبة التشفير لمحاكاة المشغل الجديد
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// الهيدرز الأساسية التي تخدع الموقع وتوهمه أن الطلب من متصفح شرعي
+// الهيدرز الافتراضية كخيار بديل
 const DEFAULT_HEADERS = {
     "Origin": "https://www.fasel-hd.co",
     "Referer": "https://www.fasel-hd.co/",
@@ -19,10 +20,84 @@ app.get('/api/extract', async (req, res) => {
     if (!targetUrl) return res.status(400).json({ error: 'يرجى تمرير رابط url صالح.' });
 
     try {
-        const response = await axios.get(targetUrl, { headers: DEFAULT_HEADERS });
+        const response = await axios.get(targetUrl, { headers: { "User-Agent": DEFAULT_HEADERS["User-Agent"] } });
+        const html = response.data;
+        const targetOrigin = new URL(targetUrl).origin;
 
-        const scriptMatch = response.data.match(/(var video = document\.getElementById\('video'\);[\s\S]+?)<\/script>/);
-        if (!scriptMatch) return res.status(404).json({ error: 'لم يتم العثور على سكريبت المشغل.' });
+        // -- [القسم الأول]: محاولة استخراج بيانات المشغل الجديد (YasirTV / Sir-TV) --
+        if (html.includes('window.tabsConfig') || html.includes('generateToken')) {
+            // 1. استخراج المسار الأساسي للفيديو
+            const pathMatch = html.match(/data-path="([^"]+)"/);
+            const path = pathMatch ? pathMatch[1] : '';
+
+            // 2. استخراج وفك تشفير إعدادات السيرفر (tabsConfig)
+            let tabsConfig = [];
+            const _0xMatch = html.match(/var _0x="([^"]+)"/);
+            const kMatch = html.match(/var k="([^"]+)"/);
+            if (_0xMatch && kMatch) {
+                const _0x = _0xMatch[1];
+                const k = kMatch[1];
+                const d = Buffer.from(_0x, 'base64').toString('binary');
+                let r = "";
+                for (let i = 0; i < d.length; i++) {
+                    r += String.fromCharCode(d.charCodeAt(i) ^ k.charCodeAt(i % k.length));
+                }
+                try { tabsConfig = JSON.parse(r); } catch (e) {}
+            }
+
+            // 3. استخراج المفتاح السري وتوليد التوكن (Session ID & Token)
+            const _eMatch = html.match(/var _e="([^"]+)"/);
+            let streamUrl = '';
+            
+            if (_eMatch && path) {
+                // فك تشفير المتغير _e للحصول على المفتاح السري
+                const _s = Buffer.from(_eMatch[1], 'base64').toString('utf8');
+                // توليد session_id عشوائي (32 حرف)
+                const sid = crypto.randomBytes(16).toString('hex');
+                
+                // تهيئة المسار للتشابك مع دالة توليد التوكن
+                let p = path;
+                if (!p.startsWith("kooora/")) p = "kooora/" + p;
+                if (p.endsWith(".m3u8")) p = p.slice(0, -5);
+
+                // حساب التوكن النهائي
+                const token = crypto.createHash('md5').update(p + sid + _s).digest('hex');
+
+                // تحديد الهوست بناءً على الـ tabsConfig أو استخدام النطاق الحالي كبديل
+                let host = targetOrigin;
+                if (tabsConfig && tabsConfig.length > 0) {
+                    const conf = tabsConfig[0];
+                    if (conf.host) host = conf.host;
+                    else if (conf.server) host = conf.server;
+                    else if (conf.domain) host = conf.domain;
+                }
+                host = host.replace(/\/$/, '');
+                if (!host.startsWith('http')) host = 'https://' + host;
+
+                // بناء رابط الـ M3U8 النهائي
+                streamUrl = `${host}/${p}.m3u8?token=${token}&session_id=${sid}`;
+            }
+
+            if (streamUrl) {
+                // دمج الهيدرز المستخرجة في رابط البروكسي
+                const proxyUrl = `${req.protocol}://${req.get('host')}/api/proxy?url=${encodeURIComponent(streamUrl)}&referer=${encodeURIComponent(targetUrl)}&origin=${encodeURIComponent(targetOrigin)}`;
+                
+                return res.json({
+                    success: true,
+                    stream_url_direct: streamUrl,
+                    proxy_url: proxyUrl,
+                    headers: {
+                        "Origin": targetOrigin,
+                        "Referer": targetUrl,
+                        "User-Agent": DEFAULT_HEADERS["User-Agent"]
+                    }
+                });
+            }
+        }
+
+        // -- [القسم الثاني]: المشغل القديم (FaselHD) للروابط السابقة --
+        const scriptMatch = html.match(/(var video = document\.getElementById\('video'\);[\s\S]+?)<\/script>/);
+        if (!scriptMatch) return res.status(404).json({ error: 'لم يتم العثور على سكريبت المشغل في كلا النوعين.' });
 
         const scriptCode = scriptMatch[1];
         const sandbox = {
@@ -34,12 +109,12 @@ app.get('/api/extract', async (req, res) => {
         vm.createContext(sandbox); vm.runInContext(scriptCode, sandbox);
 
         if (sandbox.videoSrc) {
-            // توليد رابط البروكسي الخاص بنا
             const proxyUrl = `${req.protocol}://${req.get('host')}/api/proxy?url=${encodeURIComponent(sandbox.videoSrc)}`;
             return res.json({
                 success: true,
                 stream_url_direct: sandbox.videoSrc, 
-                proxy_url: proxyUrl 
+                proxy_url: proxyUrl,
+                headers: DEFAULT_HEADERS
             });
         } else {
             return res.status(500).json({ error: 'لم يتم العثور على الرابط.' });
@@ -49,64 +124,63 @@ app.get('/api/extract', async (req, res) => {
     }
 });
 
-// 2. مسار البروكسي الذكي (يعالج الـ M3U8 والـ TS)
+// 2. مسار البروكسي الذكي (يستقبل الهيدرز الديناميكية)
 app.get('/api/proxy', async (req, res) => {
     const targetUrl = req.query.url;
     if (!targetUrl) return res.status(400).send('URL is required');
 
-    // السماح للمتصفح ومقاطع الفيديو بالعمل بدون مشاكل CORS
+    // استخراج الهيدرز من الـ Query Parameters إن وجدت، أو استخدام الافتراضية
+    const origin = req.query.origin || DEFAULT_HEADERS["Origin"];
+    const referer = req.query.referer || DEFAULT_HEADERS["Referer"];
+    
+    const dynamicHeaders = {
+        "Origin": origin,
+        "Referer": referer,
+        "User-Agent": DEFAULT_HEADERS["User-Agent"]
+    };
+
     res.setHeader('Access-Control-Allow-Origin', '*');
 
     try {
-        // التحقق مما إذا كان الرابط هو لملف M3U8
         const isM3u8 = targetUrl.includes('.m3u8');
 
         if (isM3u8) {
-            // جلب ملف الـ M3U8 كنص
-            const response = await axios.get(targetUrl, { headers: DEFAULT_HEADERS });
+            const response = await axios.get(targetUrl, { headers: dynamicHeaders });
             let content = response.data;
-
             const baseUrl = new URL(targetUrl);
             const lines = content.split('\n');
 
-            // تعديل الروابط داخل الملف
             const modifiedLines = lines.map(line => {
                 line = line.trim();
                 if (!line) return line;
 
-                // معالجة روابط مفاتيح التشفير إن وجدت
+                // إعادة توجيه المفاتيح (Keys) وتمرير الهيدرز معها
                 if (line.startsWith('#EXT-X-KEY') && line.includes('URI="')) {
                     return line.replace(/URI="([^"]+)"/, (match, uri) => {
                         const absoluteUri = new URL(uri, baseUrl.href).href;
-                        const proxyUri = `${req.protocol}://${req.get('host')}/api/proxy?url=${encodeURIComponent(absoluteUri)}`;
+                        const proxyUri = `${req.protocol}://${req.get('host')}/api/proxy?url=${encodeURIComponent(absoluteUri)}&referer=${encodeURIComponent(referer)}&origin=${encodeURIComponent(origin)}`;
                         return `URI="${proxyUri}"`;
                     });
                 }
 
-                // ترك السطور التي تبدأ بـ # (إعدادات المشغل) كما هي
                 if (line.startsWith('#')) return line;
 
-                // السطر عبارة عن رابط لملف فيديو (.ts) أو قائمة جودات أخرى
-                // نحوله إلى رابط كامل أولاً
                 const absoluteUrlObj = new URL(line, baseUrl.href);
-
-                // بعض السيرفرات تحتاج التوكن (Query Parameters) الموجود في الرابط الأصلي، نمرره هنا
                 baseUrl.searchParams.forEach((value, key) => {
                     if (!absoluteUrlObj.searchParams.has(key)) {
                         absoluteUrlObj.searchParams.set(key, value);
                     }
                 });
 
-                // توجيه الرابط ليمر عبر البروكسي الخاص بنا
-                return `${req.protocol}://${req.get('host')}/api/proxy?url=${encodeURIComponent(absoluteUrlObj.href)}`;
+                // إعادة توجيه أجزاء الفيديو (.ts) أو الجودات الأخرى عبر البروكسي مع الهيدرز
+                return `${req.protocol}://${req.get('host')}/api/proxy?url=${encodeURIComponent(absoluteUrlObj.href)}&referer=${encodeURIComponent(referer)}&origin=${encodeURIComponent(origin)}`;
             });
 
             res.setHeader('Content-Type', 'application/vnd.apple.mpegurl');
             return res.send(modifiedLines.join('\n'));
 
         } else {
-            // إذا كان الرابط عبارة عن ملف فيديو (TS / MP4)، نقوم بعمل بث (Stream) مباشر
-            const headers = { ...DEFAULT_HEADERS };
+            const headers = { ...dynamicHeaders };
             if (req.headers.range) headers['Range'] = req.headers.range;
 
             const response = await axios({
@@ -117,7 +191,6 @@ app.get('/api/proxy', async (req, res) => {
                 validateStatus: status => status >= 200 && status < 300 
             });
 
-            // تمرير الهيدرز المهمة لمشغل الفيديو
             ['content-type', 'content-length', 'accept-ranges', 'content-range'].forEach(h => {
                 if (response.headers[h]) res.setHeader(h, response.headers[h]);
             });
