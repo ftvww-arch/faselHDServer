@@ -5,56 +5,43 @@ const vm = require('vm');
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// الهيدرز الأساسية الموحدة
-const DEFAULT_USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36";
+// الهيدرز الأساسية التي تخدع السيرفر وتوهمه أن الطلب من الموقع الأصلي
+const DEFAULT_HEADERS = {
+    "Origin": "https://www.fasel-hd.co",
+    "Referer": "https://www.fasel-hd.co/",
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8"
+};
 
 // 1. مسار الاستخراج
 app.get('/api/extract', async (req, res) => {
     const targetUrl = req.query.url; 
     if (!targetUrl) return res.status(400).json({ error: 'يرجى تمرير رابط url صالح.' });
 
-    // استخراج الدومين الأصلي لاستخدامه كـ Origin و Referer
-    let originHost;
     try {
-        const urlObj = new URL(targetUrl);
-        originHost = `${urlObj.protocol}//${urlObj.host}`;
-    } catch (e) {
-        return res.status(400).json({ error: 'الرابط غير صالح' });
-    }
-
-    const customHeaders = {
-        "User-Agent": DEFAULT_USER_AGENT,
-        "Referer": targetUrl, 
-        "Origin": originHost
-    };
-
-    try {
-        const response = await axios.get(targetUrl, { headers: customHeaders });
+        const response = await axios.get(targetUrl, { headers: DEFAULT_HEADERS });
         const html = response.data;
 
-        // طباعة جزء من رد السيرفر في الكونسول للتأكد من عدم وجود حظر Cloudflare
-        console.log("Server Response Check:", html.substring(0, 150));
-
-        // كود بحث محسن يدعم الأسطر المتعددة لاصطياد السكريبت المشفر بالكامل
-        const scriptMatch = html.match(/eval\(function\(p,a,c,k,e,d\)[\s\S]*?\.split\('\|'\)\)\)/);
+        // ريجكس فولاذي: يبحث عن كود التشفير بغض النظر عن أسماء المتغيرات (p,a,c,k,e,d) أو الفراغات
+        const scriptMatch = html.match(/eval\s*\(\s*function\s*\([^)]+\)[\s\S]*?split\(['"]\|['"]\)\)\)/);
         
         if (!scriptMatch) {
             return res.status(404).json({ 
                 error: 'لم يتم العثور على سكريبت المشغل المشفر.',
-                is_cloudflare_blocked: html.includes('Cloudflare') || html.includes('Just a moment') || html.includes('challenge-platform')
+                is_cloudflare_blocked: html.includes('Cloudflare') || html.includes('Just a moment'),
+                // عرض أول 300 حرف من الرد لتعرف فوراً ماذا أرجع السيرفر (صفحة خطأ أم تحديث جديد؟)
+                html_preview: html.substring(0, 300) 
             });
         }
 
         const packedScript = scriptMatch[0];
         let extractedVideoUrl = null;
 
-        // بناء كائن jQuery مزيف لتجنب الأخطاء أثناء فك التشفير
         const mockJQuery = new Proxy(function() {}, {
             get: (target, prop) => mockJQuery,
             apply: (target, thisArg, argumentsList) => mockJQuery
         });
 
-        // البيئة الوهمية لاصطياد الرابط
         const sandbox = {
             $: mockJQuery,
             jQuery: mockJQuery,
@@ -85,8 +72,8 @@ app.get('/api/extract', async (req, res) => {
         vm.runInContext(packedScript, sandbox);
 
         if (extractedVideoUrl) {
-            // نقوم بتمرير رابط الميديا + الرابط المرجعي (Referer) إلى البروكسي
-            const proxyUrl = `${req.protocol}://${req.get('host')}/api/proxy?url=${encodeURIComponent(extractedVideoUrl)}&referer=${encodeURIComponent(targetUrl)}`;
+            // توجيه الرابط للبروكسي الخاص بنا ليقوم بمعالجة كل القطع وتمريرها للتطبيق
+            const proxyUrl = `${req.protocol}://${req.get('host')}/api/proxy?url=${encodeURIComponent(extractedVideoUrl)}`;
             
             return res.json({
                 success: true,
@@ -94,47 +81,28 @@ app.get('/api/extract', async (req, res) => {
                 proxy_url: proxyUrl
             });
         } else {
-            return res.status(500).json({ error: 'تم الفك ولكن لم يُعثر على الرابط داخل الإعدادات.' });
+            return res.status(500).json({ error: 'تم فك التشفير بنجاح ولكن لم يُعثر على رابط البث في الإعدادات.' });
         }
     } catch (error) {
-        // التقاط أخطاء حظر الخوادم (مثل 403)
-        const isCloudflare = error.response && (error.response.status === 403 || error.response.status === 503);
         return res.status(500).json({ 
             error: 'حدث خطأ أثناء محاولة جلب الصفحة', 
-            details: error.message,
-            is_cloudflare_blocked: isCloudflare
+            details: error.message
         });
     }
 });
 
-// 2. مسار البروكسي الذكي (لدمج الروابط في تطبيق الأندرويد)
+// 2. مسار البروكسي الذكي (لضمان استقرار البث داخل المشغلات مثل ExoPlayer)
 app.get('/api/proxy', async (req, res) => {
     const targetUrl = req.query.url;
-    const refererUrl = req.query.referer; 
-
     if (!targetUrl) return res.status(400).send('URL is required');
 
     res.setHeader('Access-Control-Allow-Origin', '*');
-
-    const proxyHeaders = {
-        "User-Agent": DEFAULT_USER_AGENT
-    };
-    
-    if (refererUrl) {
-        try {
-            const refObj = new URL(refererUrl);
-            proxyHeaders["Referer"] = refererUrl;
-            proxyHeaders["Origin"] = `${refObj.protocol}//${refObj.host}`;
-        } catch (e) {
-            // تجاوز في حال كان الرابط غير صالح
-        }
-    }
 
     try {
         const isM3u8 = targetUrl.includes('.m3u8');
 
         if (isM3u8) {
-            const response = await axios.get(targetUrl, { headers: proxyHeaders });
+            const response = await axios.get(targetUrl, { headers: DEFAULT_HEADERS });
             let content = response.data;
 
             const baseUrl = new URL(targetUrl);
@@ -144,11 +112,11 @@ app.get('/api/proxy', async (req, res) => {
                 line = line.trim();
                 if (!line) return line;
 
-                // معالجة مفاتيح التشفير
+                // معالجة مفاتيح التشفير AES إن وجدت
                 if (line.startsWith('#EXT-X-KEY') && line.includes('URI="')) {
                     return line.replace(/URI="([^"]+)"/, (match, uri) => {
                         const absoluteUri = new URL(uri, baseUrl.href).href;
-                        const proxyUri = `${req.protocol}://${req.get('host')}/api/proxy?url=${encodeURIComponent(absoluteUri)}&referer=${encodeURIComponent(refererUrl || '')}`;
+                        const proxyUri = `${req.protocol}://${req.get('host')}/api/proxy?url=${encodeURIComponent(absoluteUri)}`;
                         return `URI="${proxyUri}"`;
                     });
                 }
@@ -163,16 +131,16 @@ app.get('/api/proxy', async (req, res) => {
                     }
                 });
 
-                // تمرير كل قطعة TS عبر البروكسي مجدداً
-                return `${req.protocol}://${req.get('host')}/api/proxy?url=${encodeURIComponent(absoluteUrlObj.href)}&referer=${encodeURIComponent(refererUrl || '')}`;
+                // توجيه جميع المقاطع لتمر عبر البروكسي محملة بالهيدرز الصحيحة
+                return `${req.protocol}://${req.get('host')}/api/proxy?url=${encodeURIComponent(absoluteUrlObj.href)}`;
             });
 
             res.setHeader('Content-Type', 'application/vnd.apple.mpegurl');
             return res.send(modifiedLines.join('\n'));
 
         } else {
-            // بث مقاطع TS مباشرة للمشغل
-            const headers = { ...proxyHeaders };
+            // معالجة تدفق الفيديو المباشر (TS / MP4)
+            const headers = { ...DEFAULT_HEADERS };
             if (req.headers.range) headers['Range'] = req.headers.range;
 
             const response = await axios({
