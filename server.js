@@ -1,12 +1,9 @@
 const express = require('express');
 const axios = require('axios');
 const vm = require('vm');
-const cors = require('cors'); // لتجنب مشاكل CORS إن كنت تستخدم ويب بلاير مستقبلاً
 
 const app = express();
 const PORT = process.env.PORT || 3000;
-
-app.use(cors());
 
 // الهيدرز الأساسية الموحدة
 const DEFAULT_USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36";
@@ -27,7 +24,7 @@ app.get('/api/extract', async (req, res) => {
 
     const customHeaders = {
         "User-Agent": DEFAULT_USER_AGENT,
-        "Referer": targetUrl, // نستخدم الرابط نفسه كمرجع
+        "Referer": targetUrl, 
         "Origin": originHost
     };
 
@@ -35,9 +32,18 @@ app.get('/api/extract', async (req, res) => {
         const response = await axios.get(targetUrl, { headers: customHeaders });
         const html = response.data;
 
-        // البحث عن الكود المشفر الخاص بـ jwplayer
-        const scriptMatch = html.match(/eval\(function\(p,a,c,k,e,d\).*?\)\)/);
-        if (!scriptMatch) return res.status(404).json({ error: 'لم يتم العثور على سكريبت المشغل المشفر.' });
+        // طباعة جزء من رد السيرفر في الكونسول للتأكد من عدم وجود حظر Cloudflare
+        console.log("Server Response Check:", html.substring(0, 150));
+
+        // كود بحث محسن يدعم الأسطر المتعددة لاصطياد السكريبت المشفر بالكامل
+        const scriptMatch = html.match(/eval\(function\(p,a,c,k,e,d\)[\s\S]*?\.split\('\|'\)\)\)/);
+        
+        if (!scriptMatch) {
+            return res.status(404).json({ 
+                error: 'لم يتم العثور على سكريبت المشغل المشفر.',
+                is_cloudflare_blocked: html.includes('Cloudflare') || html.includes('Just a moment') || html.includes('challenge-platform')
+            });
+        }
 
         const packedScript = scriptMatch[0];
         let extractedVideoUrl = null;
@@ -85,28 +91,31 @@ app.get('/api/extract', async (req, res) => {
             return res.json({
                 success: true,
                 stream_url_direct: extractedVideoUrl,
-                proxy_url: proxyUrl,
-                // نعيد الهيدرز التي تم اكتشافها لتتمكن من استخدامها مباشرة في التطبيق إن أردت
-                required_headers: customHeaders 
+                proxy_url: proxyUrl
             });
         } else {
-            return res.status(500).json({ error: 'تم الفك ولكن لم يُعثر على الرابط.' });
+            return res.status(500).json({ error: 'تم الفك ولكن لم يُعثر على الرابط داخل الإعدادات.' });
         }
     } catch (error) {
-        return res.status(500).json({ error: 'خطأ', details: error.message });
+        // التقاط أخطاء حظر الخوادم (مثل 403)
+        const isCloudflare = error.response && (error.response.status === 403 || error.response.status === 503);
+        return res.status(500).json({ 
+            error: 'حدث خطأ أثناء محاولة جلب الصفحة', 
+            details: error.message,
+            is_cloudflare_blocked: isCloudflare
+        });
     }
 });
 
-// 2. مسار البروكسي الذكي
+// 2. مسار البروكسي الذكي (لدمج الروابط في تطبيق الأندرويد)
 app.get('/api/proxy', async (req, res) => {
     const targetUrl = req.query.url;
-    const refererUrl = req.query.referer; // نستقبل المرجع
+    const refererUrl = req.query.referer; 
 
     if (!targetUrl) return res.status(400).send('URL is required');
 
     res.setHeader('Access-Control-Allow-Origin', '*');
 
-    // تجهيز الهيدرز للبروكسي بناءً على المرجع القادم
     const proxyHeaders = {
         "User-Agent": DEFAULT_USER_AGENT
     };
@@ -117,7 +126,7 @@ app.get('/api/proxy', async (req, res) => {
             proxyHeaders["Referer"] = refererUrl;
             proxyHeaders["Origin"] = `${refObj.protocol}//${refObj.host}`;
         } catch (e) {
-            // تجاهل إن كان الرابط غير صالح
+            // تجاوز في حال كان الرابط غير صالح
         }
     }
 
@@ -139,7 +148,6 @@ app.get('/api/proxy', async (req, res) => {
                 if (line.startsWith('#EXT-X-KEY') && line.includes('URI="')) {
                     return line.replace(/URI="([^"]+)"/, (match, uri) => {
                         const absoluteUri = new URL(uri, baseUrl.href).href;
-                        // نمرر المرجع (Referer) مرة أخرى مع طلب المفتاح
                         const proxyUri = `${req.protocol}://${req.get('host')}/api/proxy?url=${encodeURIComponent(absoluteUri)}&referer=${encodeURIComponent(refererUrl || '')}`;
                         return `URI="${proxyUri}"`;
                     });
@@ -155,7 +163,7 @@ app.get('/api/proxy', async (req, res) => {
                     }
                 });
 
-                // نمرر المرجع (Referer) مرة أخرى لكل مقطع فيديو (TS) أو قائمة جودات
+                // تمرير كل قطعة TS عبر البروكسي مجدداً
                 return `${req.protocol}://${req.get('host')}/api/proxy?url=${encodeURIComponent(absoluteUrlObj.href)}&referer=${encodeURIComponent(refererUrl || '')}`;
             });
 
@@ -163,7 +171,7 @@ app.get('/api/proxy', async (req, res) => {
             return res.send(modifiedLines.join('\n'));
 
         } else {
-            // معالجة مقاطع الـ TS
+            // بث مقاطع TS مباشرة للمشغل
             const headers = { ...proxyHeaders };
             if (req.headers.range) headers['Range'] = req.headers.range;
 
