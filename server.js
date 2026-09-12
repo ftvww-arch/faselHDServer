@@ -1,17 +1,12 @@
+// ملف server.js
 const express = require('express');
 const axios = require('axios');
 const vm = require('vm');
-const { HttpsProxyAgent } = require('https-proxy-agent');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// ضع بيانات البروكسي هنا (IP و Port)
-// الصيغة: 'http://ip:port' أو 'http://username:password@ip:port'
-const PROXY_URL = 'http://123.45.67.89:8080'; // <-- استبدل هذا ببروكسي حقيقي يعمل
-const httpsAgent = new HttpsProxyAgent(PROXY_URL);
-
-// الهيدرز الأساسية التي تخدع السيرفر
+// الهيدرز الأساسية التي تخدع السيرفر وتوهمه أن الطلب من الموقع الأصلي
 const DEFAULT_HEADERS = {
     "Origin": "https://www.fasel-hd.co",
     "Referer": "https://www.fasel-hd.co/",
@@ -25,13 +20,10 @@ app.get('/api/extract', async (req, res) => {
     if (!targetUrl) return res.status(400).json({ error: 'يرجى تمرير رابط url صالح.' });
 
     try {
-        // تم دمج البروكسي هنا لتجاوز الحظر الجغرافي
-        const response = await axios.get(targetUrl, { 
-            headers: DEFAULT_HEADERS,
-            httpsAgent: httpsAgent 
-        });
+        const response = await axios.get(targetUrl, { headers: DEFAULT_HEADERS });
         const html = response.data;
 
+        // ريجكس فولاذي: يبحث عن كود التشفير بغض النظر عن أسماء المتغيرات
         const scriptMatch = html.match(/eval\s*\(\s*function\s*\([^)]+\)[\s\S]*?split\(['"]\|['"]\)\)\)/);
         
         if (!scriptMatch) {
@@ -81,6 +73,7 @@ app.get('/api/extract', async (req, res) => {
 
         if (extractedVideoUrl) {
             const proxyUrl = `${req.protocol}://${req.get('host')}/api/proxy?url=${encodeURIComponent(extractedVideoUrl)}`;
+            
             return res.json({
                 success: true,
                 stream_url_direct: extractedVideoUrl,
@@ -91,7 +84,7 @@ app.get('/api/extract', async (req, res) => {
         }
     } catch (error) {
         return res.status(500).json({ 
-            error: 'حدث خطأ أثناء محاولة جلب الصفحة عبر البروكسي', 
+            error: 'حدث خطأ أثناء محاولة جلب الصفحة', 
             details: error.message
         });
     }
@@ -108,11 +101,7 @@ app.get('/api/proxy', async (req, res) => {
         const isM3u8 = targetUrl.includes('.m3u8');
 
         if (isM3u8) {
-            // استخدام البروكسي لجلب ملفات القوائم
-            const response = await axios.get(targetUrl, { 
-                headers: DEFAULT_HEADERS,
-                httpsAgent: httpsAgent
-            });
+            const response = await axios.get(targetUrl, { headers: DEFAULT_HEADERS });
             let content = response.data;
 
             const baseUrl = new URL(targetUrl);
@@ -133,6 +122,7 @@ app.get('/api/proxy', async (req, res) => {
                 if (line.startsWith('#')) return line;
 
                 const absoluteUrlObj = new URL(line, baseUrl.href);
+
                 baseUrl.searchParams.forEach((value, key) => {
                     if (!absoluteUrlObj.searchParams.has(key)) {
                         absoluteUrlObj.searchParams.set(key, value);
@@ -146,7 +136,6 @@ app.get('/api/proxy', async (req, res) => {
             return res.send(modifiedLines.join('\n'));
 
         } else {
-            // استخدام البروكسي لجلب مقاطع TS المباشرة
             const headers = { ...DEFAULT_HEADERS };
             if (req.headers.range) headers['Range'] = req.headers.range;
 
@@ -155,7 +144,6 @@ app.get('/api/proxy', async (req, res) => {
                 url: targetUrl,
                 responseType: 'stream',
                 headers: headers,
-                httpsAgent: httpsAgent,
                 validateStatus: status => status >= 200 && status < 300 
             });
 
